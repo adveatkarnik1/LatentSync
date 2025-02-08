@@ -292,6 +292,74 @@ class LipsyncPipeline(DiffusionPipeline):
             out_frames.append(out_frame)
         return np.stack(out_frames, axis=0)
 
+    def apply_superres_to_synced_faces(self, original_video, original_faces, synced_video_frames, boxes, superres="none"):
+        """
+        Enhances faces in synced_video_frames using GFPGAN/CodeFormer if needed and reintegrates them into the original video.
+
+        Args:
+            original_video (list of np.ndarray): Full video frames (background included).
+            original_faces (torch.Tensor): Extracted faces from the original video.
+            synced_video_frames (list of np.ndarray): Frames with restored faces (only faces).
+            boxes (list of tuples): Bounding boxes (x1, y1, x2, y2) for each face.
+            superres (str): Choose between 'gfpgan', 'codeformer', or 'none' for super-resolution.
+
+        Returns:
+            np.ndarray: Full video frames with enhanced faces reintegrated.
+        """
+
+        enhanced_faces = []
+
+        for i in tqdm.tqdm(range(len(synced_video_frames)), desc="Processing frames..."):
+            original_frame = original_video[i]  # Full original frame
+            input_face = original_faces[i]  # Extracted face from original frame
+            restored_face = synced_video_frames[i]  # Face from synced_video_frames
+
+            # Get input & output face sizes
+            input_face_h, input_face_w = input_face.shape[-2], input_face.shape[-1]
+            restored_face_h, restored_face_w = restored_face.shape[:2]
+
+            # Compute resolution ratio (Input Face vs. Output Face)
+            res_ratio_h = input_face_h / restored_face_h
+            res_ratio_w = input_face_w / restored_face_w
+
+            # Apply Super-Resolution if Needed
+            if res_ratio_h > 1.0 or res_ratio_w > 1.0:
+                print(f"Applying super-resolution on face {i}...")
+                
+                if superres.lower() == "gfpgan":
+                    restored_face = self.gfpgan_enhance(restored_face)
+                elif superres.lower() == "codeformer":
+                    restored_face = self.codeformer_enhance(restored_face)
+
+            # Ensure the restored face is exactly the correct size
+            restored_face_h, restored_face_w = restored_face.shape[:2]
+            if restored_face_h != input_face_h or restored_face_w != input_face_w:
+                print("Restored face size mismatch, resizing to match input face size...")
+                restored_face = cv2.resize(restored_face, (input_face_w, input_face_h), interpolation=cv2.INTER_LANCZOS4)
+
+            # Get face bounding box
+            x1, y1, x2, y2 = boxes[i]  # Ensure boxes[i] contains (x1, y1, x2, y2)
+
+            # Resize face to fit back into original frame
+            restored_face_resized = cv2.resize(restored_face, (x2 - x1, y2 - y1), interpolation=cv2.INTER_LANCZOS4)
+
+            # Paste the final high-quality face back into the full frame
+            original_frame[y1:y2, x1:x2] = restored_face_resized
+            # restored_face[y1:y2, x1:x2] = restored_face_resized
+
+            enhanced_faces.append(original_frame)
+
+        return np.stack(enhanced_faces, axis=0)
+    
+    def gfpgan_enhance(self, face):
+        print("Enhancing face using GFPGAN...")
+        return self.gfpgan.restoration_pipeline(face.unsqueeze(0)).squeeze(0)  
+
+    def codeformer_enhance(self, face):
+        print("Enhancing face using CodeFormer...")
+        return self.codeformer.restoration_pipeline(face.unsqueeze(0), w=0.5).squeeze(0) 
+
+
     @torch.no_grad()
     def __call__(
         self,
@@ -312,6 +380,7 @@ class LipsyncPipeline(DiffusionPipeline):
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
+        superres: str = "CodeFormer",
         **kwargs,
     ):
         is_train = self.unet.training
@@ -460,6 +529,8 @@ class LipsyncPipeline(DiffusionPipeline):
 
         if is_train:
             self.unet.train()
+        
+        synced_video_frames = self.apply_superres_to_synced_faces(original_video_frames,faces, synced_video_frames, boxes, superres)
 
         temp_dir = "temp"
         if os.path.exists(temp_dir):
